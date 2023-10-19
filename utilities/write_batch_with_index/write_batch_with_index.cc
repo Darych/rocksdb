@@ -3,7 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-
 #include "rocksdb/utilities/write_batch_with_index.h"
 
 #include <memory>
@@ -17,11 +16,13 @@
 #include "options/db_options.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/iterator.h"
+#include "rocksdb/slice.h"
 #include "util/cast_util.h"
 #include "util/string_util.h"
 #include "utilities/write_batch_with_index/write_batch_with_index_internal.h"
 
 namespace ROCKSDB_NAMESPACE {
+
 struct WriteBatchWithIndex::Rep {
   explicit Rep(const Comparator* index_comparator, size_t reserved_bytes = 0,
                size_t max_bytes = 0, bool _overwrite_key = false,
@@ -122,6 +123,7 @@ bool WriteBatchWithIndex::Rep::UpdateExistingEntryWithCfId(
 
 void WriteBatchWithIndex::Rep::AddOrUpdateIndex(
     ColumnFamilyHandle* column_family, const Slice& key, WriteType type) {
+  // We update index without timestamp in key
   if (!UpdateExistingEntry(column_family, key, type)) {
     uint32_t cf_id = GetColumnFamilyID(column_family);
     const auto* cf_cmp = GetColumnFamilyUserComparator(column_family);
@@ -335,13 +337,17 @@ Status WriteBatchWithIndex::Put(const Slice& key, const Slice& value) {
 }
 
 Status WriteBatchWithIndex::Put(ColumnFamilyHandle* column_family,
-                                const Slice& /*key*/, const Slice& /*ts*/,
-                                const Slice& /*value*/) {
+                                const Slice& key, const Slice& ts,
+                                const Slice& value) {
   if (!column_family) {
     return Status::InvalidArgument("column family handle cannot be nullptr");
   }
-  // TODO: support WBWI::Put() with timestamp.
-  return Status::NotSupported();
+  rep->SetLastEntryOffset();
+  auto s = rep->write_batch.Put(column_family, key, ts, value);
+  if (s.ok()) {
+    rep->AddOrUpdateIndex(column_family, key, kPutRecord);
+  }
+  return s;
 }
 
 Status WriteBatchWithIndex::Delete(ColumnFamilyHandle* column_family,
@@ -364,12 +370,16 @@ Status WriteBatchWithIndex::Delete(const Slice& key) {
 }
 
 Status WriteBatchWithIndex::Delete(ColumnFamilyHandle* column_family,
-                                   const Slice& /*key*/, const Slice& /*ts*/) {
+                                   const Slice& key, const Slice& ts) {
   if (!column_family) {
     return Status::InvalidArgument("column family handle cannot be nullptr");
   }
-  // TODO: support WBWI::Delete() with timestamp.
-  return Status::NotSupported();
+  rep->SetLastEntryOffset();
+  auto s = rep->write_batch.Delete(column_family, key, ts);
+  if (s.ok()) {
+    rep->AddOrUpdateIndex(column_family, key, kDeleteRecord);
+  }
+  return s;
 }
 
 Status WriteBatchWithIndex::SingleDelete(ColumnFamilyHandle* column_family,
@@ -392,13 +402,16 @@ Status WriteBatchWithIndex::SingleDelete(const Slice& key) {
 }
 
 Status WriteBatchWithIndex::SingleDelete(ColumnFamilyHandle* column_family,
-                                         const Slice& /*key*/,
-                                         const Slice& /*ts*/) {
+                                         const Slice& key, const Slice& ts) {
   if (!column_family) {
     return Status::InvalidArgument("column family handle cannot be nullptr");
   }
-  // TODO: support WBWI::SingleDelete() with timestamp.
-  return Status::NotSupported();
+  rep->SetLastEntryOffset();
+  auto s = rep->write_batch.SingleDelete(column_family, key, ts);
+  if (s.ok()) {
+    rep->AddOrUpdateIndex(column_family, key, kSingleDeleteRecord);
+  }
+  return s;
 }
 
 Status WriteBatchWithIndex::Merge(ColumnFamilyHandle* column_family,
@@ -547,9 +560,9 @@ Status WriteBatchWithIndex::GetFromBatchAndDB(
       // Merge result from DB with merges in Batch
       std::string merge_result;
       if (s.ok()) {
-        s = wbwii.MergeKey(key, pinnable_val, &merge_result);
+        s = wbwii.MergeKey(key, *pinnable_val, &merge_result);
       } else {  // Key not present in db (s.IsNotFound())
-        s = wbwii.MergeKey(key, nullptr, &merge_result);
+        s = wbwii.MergeKey(key, &merge_result);
       }
       if (s.ok()) {
         pinnable_val->Reset();
@@ -644,11 +657,10 @@ void WriteBatchWithIndex::MultiGetFromBatchAndDB(
         std::string merged_value;
         // Merge result from DB with merges in Batch
         if (key.s->ok()) {
-          *key.s = wbwii.MergeKey(*key.key, iter->value, merge_result.second,
+          *key.s = wbwii.MergeKey(*key.key, *iter->value, merge_result.second,
                                   &merged_value);
         } else {  // Key not present in db (s.IsNotFound())
-          *key.s = wbwii.MergeKey(*key.key, nullptr, merge_result.second,
-                                  &merged_value);
+          *key.s = wbwii.MergeKey(*key.key, merge_result.second, &merged_value);
         }
         if (key.s->ok()) {
           key.value->Reset();
